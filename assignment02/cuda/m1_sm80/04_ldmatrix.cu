@@ -94,46 +94,33 @@ __device__ void load_ldsm(const uint8_t* sA, const uint8_t* sBk,
     uint32_t a_smem = (uint32_t)__cvta_generic_to_shared(sA);
     uint32_t b_smem = (uint32_t)__cvta_generic_to_shared(sBn);
 
-    // A: ldmatrix.x4.b16, no .trans
-    //   A 是 16×32 fp8 行主序 (sA, 每行 32 byte).
-    //   4 个子矩阵按 2×2 排布:
-    //     sub k 行 r → A[ (k/2)*8 + r ][ (k%2)*16 .. (k%2)*16 + 15 ]
-    //   每个 lane 提供 4 个地址,每个子矩阵对应一个,row = lane & 7.
-    uint32_t a_addr[4];
-    uint32_t r = lane & 7;
-    #pragma unroll
-    for (int k = 0; k < 4; k++) {
-        uint32_t row    = ((k >> 1) << 3) + r;   // 0..15
-        uint32_t col_st = (k & 1) << 4;          // 0 或 16
-        a_addr[k] = a_smem + row * 32 + col_st;
+    // A: ldmatrix.x4.b16 (Hopper 风格: 1 source per thread).
+    {
+        uint32_t a_sub = lane >> 3;
+        uint32_t a_row = lane & 7;
+        uint32_t mi = a_sub & 1;
+        uint32_t ki = a_sub >> 1;
+        uint32_t a_addr = a_smem + (mi * 8 + a_row) * 32 + ki * 16;
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
+            "{%0,%1,%2,%3}, [%4];\n"
+            : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+            : "r"(a_addr)
+        );
     }
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.b16 "
-        "{%0,%1,%2,%3}, "
-        "[%4,%5,%6,%7];\n"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "r"(a_addr[0]), "r"(a_addr[1]), "r"(a_addr[2]), "r"(a_addr[3])
-    );
 
-    // B: ldmatrix.x2.trans.b16
-    //   B 是 32 K × 8 N. sBn 是 [8 N-row × 32 K-byte] n-major.
-    //   .trans 让 smem 行 → fragment 列:每读 16 byte (来自一个 n-row 的连续 16 K 字节),
-    //   8 b16 派给 4 lane (每 lane 2 b16 = 4 fp8).
-    //   4 lane 共享一个 n-row (n_idx = lane>>2);
-    //     sub 0 → n_idx 行 K 字节 0..15
-    //     sub 1 → n_idx 行 K 字节 16..31
-    //   8 行 × 4 lane = 32 全覆盖;2 sub 拼回 32 K = B 的全部 K.
-    uint32_t n_idx = lane >> 2;
-    uint32_t b_addr[2];
-    b_addr[0] = b_smem + n_idx * 32;        // sub 0: K[0..15] of n-row n_idx
-    b_addr[1] = b_smem + n_idx * 32 + 16;   // sub 1: K[16..31] of n-row n_idx
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.b16 "
-        "{%0,%1}, "
-        "[%2,%3];\n"
-        : "=r"(b[0]), "=r"(b[1])
-        : "r"(b_addr[0]), "r"(b_addr[1])
-    );
+    // B: ldmatrix.x2.b16 (no trans; subs split K-halves within sBn n-major).
+    {
+        uint32_t b_sub = lane >> 3;   // 0..3, sub-tile index (K-half)
+        uint32_t b_row = lane & 7;    // 0..7, row within sub-tile
+        uint32_t b_addr = b_smem + b_sub * 16 + b_row * 32;
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x2.shared::cta.b16 "
+            "{%0,%1}, [%2];\n"
+            : "=r"(b[0]), "=r"(b[1])
+            : "r"(b_addr)
+        );
+    }
 }
 
 template <bool USE_LDSM>
